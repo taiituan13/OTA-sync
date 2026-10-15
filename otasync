@@ -1,0 +1,288 @@
+// ==UserScript==
+// @name         EZCloud OTA Sync
+// @namespace    ota-booking-sync
+// @version      2.1.1
+// @description  Panel trong PMS EZCloud: booking OTA moi (Go2Joy/UrbanB), trang thai tao booking + khoa Go2Joy, nut Khoa G2J, va bang khoa Go2Joy theo phong trong.
+// @match        https://pms.ezcloudhotel.com/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_registerMenuCommand
+// @connect      script.google.com
+// @connect      script.googleusercontent.com
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // ------------------------- Config -------------------------
+  // Dán Web App URL (Deploy > Manage deployments > Web app URL) vào đây hoặc
+  // đặt qua menu Tampermonkey "Cấu hình OTA Sync".
+  const DEFAULT_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbzBZx4vq8mD7lOyG1VLopV9059yfZpjVruEcRzOdsdi-mVh-qAnfxrUhbkMQwCMzaj4jQ/exec';
+  const DEFAULT_API_TOKEN = ''; // Script Property OTA_STATUS_API_TOKEN nếu có đặt
+  const BOARD_DAYS = 14;
+  const AUTO_REFRESH_MS = 2 * 60 * 1000;
+
+  const cfg = {
+    get url() { return GM_getValue('webAppUrl', DEFAULT_WEB_APP_URL); },
+    get token() { return GM_getValue('apiToken', DEFAULT_API_TOKEN); },
+  };
+
+  GM_registerMenuCommand('Cấu hình OTA Sync', configure);
+
+  function configure() {
+    const url = prompt('Web App URL của Apps Script (.../exec):', cfg.url || '');
+    if (url === null) return;
+    GM_setValue('webAppUrl', url.trim());
+    const token = prompt('API token (để trống nếu không đặt OTA_STATUS_API_TOKEN):', cfg.token || '');
+    if (token !== null) GM_setValue('apiToken', token.trim());
+    toast('Đã lưu cấu hình.', 'ok');
+    refreshAll();
+  }
+
+  // ------------------------- API -------------------------
+  function api(params) {
+    return new Promise((resolve, reject) => {
+      if (!cfg.url) return reject(new Error('Chưa cấu hình Web App URL (menu Tampermonkey > Cấu hình OTA Sync).'));
+      const q = new URLSearchParams(Object.assign({}, params, cfg.token ? { token: cfg.token } : {}));
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url: cfg.url + (cfg.url.includes('?') ? '&' : '?') + q.toString(),
+        timeout: 90000,
+        onload: (res) => {
+          try {
+            const json = JSON.parse(res.responseText);
+            if (!json.ok) return reject(new Error(json.error || 'API lỗi'));
+            resolve(json.result);
+          } catch (e) {
+            reject(new Error('Phản hồi không phải JSON. Kiểm tra Web App URL và quyền truy cập "Anyone".'));
+          }
+        },
+        onerror: () => reject(new Error('Không gọi được Web App.')),
+        ontimeout: () => reject(new Error('Web App quá thời gian.')),
+      });
+    });
+  }
+
+  // ------------------------- UI skeleton -------------------------
+  const css = `
+    #ota-fab{position:fixed;right:18px;bottom:18px;z-index:99998;background:#E8440A;color:#fff;border:none;border-radius:24px;padding:10px 16px;font:600 13px system-ui,sans-serif;box-shadow:0 4px 14px rgba(0,0,0,.25);cursor:pointer}
+    #ota-fab .ota-pill{background:#fff;color:#E8440A;border-radius:10px;padding:0 6px;margin-left:6px;font-size:11px}
+    #ota-panel{position:fixed;right:18px;bottom:66px;width:560px;max-width:calc(100vw - 36px);max-height:calc(100vh - 100px);z-index:99999;background:#fff;border-radius:12px;box-shadow:0 10px 40px rgba(0,0,0,.3);font:13px system-ui,sans-serif;color:#1a1a1a;display:none;flex-direction:column;overflow:hidden}
+    #ota-panel.ota-open{display:flex;height:min(720px,calc(100vh - 100px));min-height:320px}
+    #ota-panel .ota-hd{background:#E8440A;color:#fff;padding:10px 14px;display:flex;align-items:center;gap:8px}
+    #ota-panel .ota-hd b{flex:1;font-size:14px}
+    #ota-panel .ota-hd button{background:rgba(255,255,255,.18);color:#fff;border:none;border-radius:6px;padding:4px 8px;cursor:pointer;font-size:12px}
+    #ota-panel .ota-tabs{display:flex;border-bottom:1px solid #e5e5e5}
+    #ota-panel .ota-tabs button{flex:1;background:none;border:none;padding:9px;cursor:pointer;font-weight:600;color:#666;border-bottom:2px solid transparent}
+    #ota-panel .ota-tabs button.ota-on{color:#E8440A;border-bottom-color:#E8440A}
+    #ota-panel .ota-body{overflow:auto;padding:10px 12px;flex:1 1 auto;min-height:0}
+    #ota-panel .ota-row{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+    #ota-panel input{flex:1;padding:7px 9px;border:1px solid #ccc;border-radius:6px;font-size:13px}
+    #ota-panel .ota-btn{background:#E8440A;color:#fff;border:none;border-radius:6px;padding:7px 10px;cursor:pointer;font-weight:600;font-size:12px}
+    #ota-panel .ota-btn.ota-sec{background:#f0f0f0;color:#333}
+    #ota-panel .ota-btn:disabled{opacity:.5;cursor:default}
+    .ota-card{border:1px solid #e5e5e5;border-radius:8px;padding:8px 10px;margin-bottom:8px}
+    .ota-card .ota-t{display:flex;justify-content:space-between;gap:8px;font-weight:600}
+    .ota-card .ota-m{color:#555;font-size:12px;margin-top:2px}
+    .ota-chip{display:inline-block;border-radius:10px;padding:1px 8px;font-size:11px;font-weight:600;margin-left:4px}
+    .ota-chip.ota-ok{background:#E8F7F0;color:#1A7F4E}.ota-chip.ota-err{background:#FDECEB;color:#C0392B}.ota-chip.ota-warn{background:#FFFBEB;color:#B45309}.ota-chip.ota-info{background:#EAF2FB;color:#1F5FA8}.ota-chip.ota-none{background:#eee;color:#666}
+    table.ota-board{border-collapse:collapse;width:100%;font-size:11px}
+    .ota-board th,.ota-board td{border:1px solid #e5e5e5;padding:0;text-align:center;height:34px;position:relative}
+    .ota-board th{background:#f7f7f7;font-weight:600;padding:4px 2px}
+    .ota-board th.ota-today{background:#FFF1EC;color:#E8440A}
+    .ota-board td.ota-rt{text-align:left;padding:0 6px;font-weight:600;white-space:nowrap;background:#fafafa}
+    .ota-board td .ota-n{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-weight:600}
+    .ota-board td.ota-f0{background:#FDECEB;color:#C0392B}.ota-board td.ota-f1{background:#FFFBEB;color:#B45309}.ota-board td.ota-fx{background:#E8F7F0;color:#1A7F4E}.ota-board td.ota-fn{background:#f3f3f3;color:#999}
+    .ota-board th,.ota-board td{height:40px}
+    .ota-board td .ota-n{align-items:flex-start;padding-top:3px;font-size:12px}
+    .ota-board td .ota-ic{position:absolute;left:0;right:0;bottom:2px;display:flex;justify-content:center;gap:1px;line-height:0;white-space:nowrap;overflow:hidden}
+    .ota-i{width:12px;height:12px;display:inline-block;vertical-align:middle;flex:none}
+    .ota-legend .ota-i{margin-right:3px}
+    .ota-i-hourly{color:#7C3AED}.ota-i-overnight{color:#C0392B}.ota-i-daily{color:#C0392B}.ota-i-lock{color:#C0392B}.ota-i-avail{color:#1F5FA8}.ota-i-warn{color:#B45309}
+    .ota-legend{display:flex;flex-wrap:wrap;gap:10px;font-size:11px;color:#555;margin:6px 0}
+    .ota-legend i{display:inline-block;width:14px;height:8px;border-radius:3px;vertical-align:middle;margin-right:3px}
+    #ota-toast{position:fixed;left:50%;bottom:90px;transform:translateX(-50%);z-index:100000;background:#1a1a1a;color:#fff;padding:8px 14px;border-radius:8px;font:12px system-ui;display:none}
+    #ota-toast.ota-ok{background:#1A7F4E}#ota-toast.ota-err{background:#C0392B}
+    .ota-muted{color:#888;font-size:12px}
+  `;
+  const style = document.createElement('style'); style.textContent = css; document.head.appendChild(style);
+
+  const fab = el('button', { id: 'ota-fab', innerHTML: 'OTA Sync<span class="ota-pill" id="ota-badge">...</span>' });
+  const panel = el('div', { id: 'ota-panel' });
+  panel.innerHTML = `
+    <div class="ota-hd"><b>OTA Sync - Go2Joy / UrbanB</b>
+      <button id="ota-refresh">Làm mới</button><button id="ota-close">X</button></div>
+    <div class="ota-tabs"><button class="ota-on" data-tab="bookings">Booking OTA</button><button data-tab="board">Bảng khoá G2J</button></div>
+    <div class="ota-body">
+      <div id="tab-bookings">
+        <div class="ota-row"><input id="ota-q" placeholder="Tìm theo số booking, tên khách, mã EZCloud..."><button class="ota-btn" id="ota-search">Tìm</button></div>
+        <div id="ota-list"><div class="ota-muted">Đang tải...</div></div>
+      </div>
+      <div id="tab-board" style="display:none">
+        <div class="ota-legend">
+          <span><i style="background:#E8F7F0"></i>còn 2+ phòng</span><span><i style="background:#FFFBEB"></i>còn 1</span><span><i style="background:#FDECEB"></i>hết phòng</span>
+          <span id="ota-legend-icons"></span>
+        </div>
+        <div id="ota-board"><div class="ota-muted">Đang tải...</div></div>
+        <div class="ota-muted" id="ota-board-meta" style="margin-top:6px"></div>
+      </div>
+    </div>`;
+  panel.querySelector('#ota-legend-icons').outerHTML =
+    `<span>${icon('hourly')} khoá theo giờ</span><span>${icon('overnight')} khoá qua đêm</span><span>${icon('daily')} khoá theo ngày</span>` +
+    `<span>${icon('avail')} booking OTA còn phòng, chưa khoá</span><span>${icon('warn')} khoá không khớp loại phòng</span>`;
+  const toastEl = el('div', { id: 'ota-toast' });
+  document.body.append(fab, panel, toastEl);
+
+  fab.onclick = () => { panel.classList.toggle('ota-open'); if (panel.classList.contains('ota-open')) refreshAll(); };
+  panel.querySelector('#ota-close').onclick = () => panel.classList.remove('ota-open');
+  panel.querySelector('#ota-refresh').onclick = refreshAll;
+  panel.querySelectorAll('.ota-tabs button').forEach((b) => (b.onclick = () => showTab(b.dataset.tab)));
+  panel.querySelector('#ota-search').onclick = search;
+  panel.querySelector('#ota-q').addEventListener('keydown', (e) => { if (e.key === 'Enter') search(); });
+
+  function showTab(name) {
+    panel.querySelectorAll('.ota-tabs button').forEach((b) => b.classList.toggle('ota-on', b.dataset.tab === name));
+    panel.querySelector('#tab-bookings').style.display = name === 'bookings' ? '' : 'none';
+    panel.querySelector('#tab-board').style.display = name === 'board' ? '' : 'none';
+  }
+
+  // ------------------------- Bookings tab -------------------------
+  async function loadRecent() {
+    const list = panel.querySelector('#ota-list');
+    try {
+      const r = await api({ recent: '1', limit: '10' });
+      renderBookings(r.matches);
+      const issues = r.matches.filter((m) => m.ezCloud.status === 'ERROR' || m.go2Joy.lockStatus === 'ERROR' || m.go2Joy.lockStatus === 'SKIPPED').length;
+      document.getElementById('ota-badge').textContent = issues ? issues + ' lỗi' : r.count;
+    } catch (e) { list.innerHTML = `<div class="ota-card" style="color:#C0392B">${esc(e.message)}</div>`; }
+  }
+
+  async function search() {
+    const q = panel.querySelector('#ota-q').value.trim();
+    if (!q) return loadRecent();
+    const list = panel.querySelector('#ota-list');
+    list.innerHTML = '<div class="ota-muted">Đang tìm...</div>';
+    try { const r = await api({ q, limit: '10' }); renderBookings(r.matches, q); }
+    catch (e) { list.innerHTML = `<div class="ota-card" style="color:#C0392B">${esc(e.message)}</div>`; }
+  }
+
+  function renderBookings(matches, q) {
+    const list = panel.querySelector('#ota-list');
+    if (!matches.length) { list.innerHTML = `<div class="ota-muted">Không có booking${q ? ' khớp "' + esc(q) + '"' : ' gần đây'}.</div>`; return; }
+    list.innerHTML = matches.map((m) => {
+      const canLock = m.ezCloud.status === 'CREATED' && m.go2Joy.lockStatus !== 'LOCKED';
+      return `<div class="ota-card">
+        <div class="ota-t"><span>${esc(m.source)} | ${esc(m.bookingNumber)} | ${esc(m.guestName)}${m.guestPhone ? ' | ' + esc(m.guestPhone) : ''}</span>
+          <span>${chip('EZ', m.ezCloud.status)}${chip('G2J', m.go2Joy.lockStatus)}${m.roomAssigned.confirmed ? chip('Phòng', 'OK') : ''}</span></div>
+        <div class="ota-m">${esc(m.roomType)} | ${esc(m.bookingType)} | ${esc(m.checkIn)} đến ${esc(m.checkOut)} | ${fmtVnd(m.paymentAmount)} ${esc(m.paymentStatus || '')}</div>
+        ${m.ezCloud.reservationRoomId ? `<div class="ota-m">EZCloud ReservationRoomId ${esc(m.ezCloud.reservationRoomId)} | ReservationId ${esc(m.ezCloud.reservationId)}</div>` : ''}
+        ${m.go2Joy.lockMessage ? `<div class="ota-m">${esc(m.go2Joy.lockMessage)}</div>` : ''}
+        ${m.ezCloud.status === 'ERROR' ? `<div class="ota-m" style="color:#C0392B">${esc(m.ezCloud.message)}</div>` : ''}
+        ${canLock ? `<div class="ota-row" style="margin:6px 0 0"><button class="ota-btn" data-lock="${esc(m.sourceKey)}" data-src="${esc(m.source)}" data-pay="${esc(m.paymentStatus || '')}">Khoá G2J</button><span class="ota-muted">Khoá cả loại phòng trên Go2Joy trong khung giờ này</span></div>` : ''}
+      </div>`;
+    }).join('');
+    list.querySelectorAll('button[data-lock]').forEach((b) => (b.onclick = () => lockG2J(b)));
+  }
+
+  async function lockG2J(btn) {
+    const isUrbanBUnpaid = btn.dataset.src.toLowerCase() === 'urbanb' && /chưa/i.test(btn.dataset.pay);
+    if (isUrbanBUnpaid && !confirm('Booking UrbanB đang "Chưa thanh toán". Xác nhận khách đã thanh toán và khoá G2J?')) return;
+    if (!isUrbanBUnpaid && !confirm('Khoá loại phòng này trên Go2Joy cho khung giờ của booking?')) return;
+    btn.disabled = true; btn.textContent = 'Đang khoá...';
+    try {
+      const r = await api({ action: 'lockG2J', sourceKey: btn.dataset.lock, confirmPaid: isUrbanBUnpaid ? '1' : '' });
+      toast('G2J ' + r.lockResult.status + ': ' + r.lockResult.message, r.lockResult.status === 'LOCKED' ? 'ok' : 'err', 6000);
+      refreshAll();
+    } catch (e) { toast(e.message, 'err', 6000); btn.disabled = false; btn.textContent = 'Khoá G2J'; }
+  }
+
+  // ------------------------- Board tab -------------------------
+  async function loadBoard() {
+    const box = panel.querySelector('#ota-board');
+    try {
+      const r = await api({ action: 'board', days: String(BOARD_DAYS) });
+      renderBoard(r.occupancy, r.locks);
+    } catch (e) { box.innerHTML = `<div class="ota-card" style="color:#C0392B">${esc(e.message)}</div>`; }
+  }
+
+  function renderBoard(occ, locksRes) {
+    const box = panel.querySelector('#ota-board');
+    if (!occ.ok) { box.innerHTML = `<div class="ota-card" style="color:#C0392B">Không đọc được timeline EZCloud: ${esc(occ.message)}</div>`; return; }
+    const today = localDate(new Date());
+    const haByType = {};
+    (locksRes.haLocks || []).forEach((l) => { (haByType[l.ezRoomTypeId] = haByType[l.ezRoomTypeId] || []).push(l); });
+    const availByType = {};
+    (locksRes.locks || []).filter((l) => l.status === 'AVAILABLE').forEach((l) => { (availByType[l.ezRoomTypeId] = availByType[l.ezRoomTypeId] || []).push(l); });
+    const ICON = { hourly: icon('hourly'), overnight: icon('overnight'), daily: icon('daily'), '': icon('lock') };
+
+    const head = '<tr><th style="text-align:left">Loại phòng</th>' + occ.days.map((d) =>
+      `<th class="${d === today ? 'ota-today' : ''}">${d.slice(8)}/${d.slice(5, 7)}<br><span style="font-weight:400">${weekday(d)}</span></th>`).join('') + '</tr>';
+
+    const rows = occ.roomTypes.map((t) => {
+      const cells = occ.days.map((d, i) => {
+        const c = t.perDay[i];
+        const cls = c.free === null ? 'ota-fn' : c.free === 0 ? 'ota-f0' : c.free === 1 ? 'ota-f1' : 'ota-fx';
+        const dayHa = (haByType[t.roomTypeId] || []).filter((l) => haCoversDay(l, d));
+        const dayAvail = (availByType[t.roomTypeId] || []).filter((l) => coversDay(l, d));
+        const icons = dayHa.map((l) => ICON[l.lockCategory]).concat(dayAvail.map(() => icon('avail'))).join('');
+        const tip = [`${t.name} ${d}: ${c.free === null ? 'không rõ' : 'trống ' + c.free + '/' + c.total + (c.freeRooms.length ? ' (' + c.freeRooms.join(', ') + ')' : '')}`]
+          .concat(dayHa.map((l) => `KHOÁ G2J ${({ hourly: 'theo giờ', overnight: 'qua đêm', daily: 'theo ngày' })[l.lockCategory] || ''} ${l.lockCategory === 'hourly' ? l.startTime + '-' + l.endTime : l.startDate + ' đến ' + l.endDate} | tạo ${l.createTime} bởi ${l.createBy}`))
+          .concat(dayAvail.map((l) => `CÒN PHÒNG, chưa khoá: ${l.source} ${l.bookingNumber} ${l.guestName} | ${l.checkIn} đến ${l.checkOut}`)).join('\n');
+        return `<td class="${cls}" title="${esc(tip)}"><div class="ota-n">${c.free === null ? '?' : c.free}</div><div class="ota-ic">${icons}</div></td>`;
+      }).join('');
+      return `<tr><td class="ota-rt" title="${esc(t.rooms.join(', '))}">${esc(t.name)} <span class="ota-muted">(${t.total})</span></td>${cells}</tr>`;
+    }).join('');
+
+    const unmappedHa = (locksRes.haLocks || []).filter((l) => !l.ezRoomTypeId);
+    const warn = unmappedHa.length
+      ? `<div class="ota-card" style="margin-top:6px;color:#B45309">${icon('warn')} ${unmappedHa.length} khoá Go2Joy không khớp loại phòng EZCloud: ${esc(unmappedHa.map((l) => l.roomTypeName + ' ' + l.startDate).join(', '))}</div>` : '';
+    box.innerHTML = `<div style="overflow:auto"><table class="ota-board">${head}${rows}</table></div>${warn}`;
+    panel.querySelector('#ota-board-meta').textContent =
+      `Số trong ô = phòng trống qua đêm (14:00 đến 12:00 hôm sau). ` +
+      (locksRes.haOk ? `${(locksRes.haLocks || []).length} khoá đang có trên Go2Joy trong ${BOARD_DAYS} ngày` : `Không đọc được khoá từ Go2Joy: ${locksRes.haMessage}`) +
+      `, ${locksRes.count} booking OTA đã xử lý. Cập nhật ${occ.generatedAt}.`;
+  }
+
+  function haCoversDay(l, day) {
+    if (l.lockCategory === 'hourly') return l.startDate === day;
+    if (l.lockCategory === 'overnight') return l.endDate > l.startDate ? (day >= l.startDate && day < l.endDate) : day === l.startDate;
+    return day >= l.startDate && day <= l.endDate; // daily / unknown: inclusive calendar days
+  }
+
+  function coversDay(lock, day) {
+    const ci = lock.checkIn.slice(0, 10), co = lock.checkOut.slice(0, 10);
+    if (lock.lockCategory === 'hourly') return ci === day;
+    if (lock.lockCategory === 'daily') return ci === day; // HA daily lock = 1 calendar day (current payload)
+    return day >= ci && (co > ci ? day < co : day === ci); // overnight: check-in night(s)
+  }
+
+  // ------------------------- helpers -------------------------
+  let timer = null;
+  function refreshAll() { loadRecent(); loadBoard(); clearTimeout(timer); timer = setTimeout(() => panel.classList.contains('ota-open') && refreshAll(), AUTO_REFRESH_MS); }
+  function chip(label, status) {
+    const s = String(status || '');
+    const cls = /CREATED|LOCKED|OK/.test(s) ? 'ota-ok' : /ERROR/.test(s) ? 'ota-err' : /SKIPPED|PARSED/.test(s) ? 'ota-warn' : /AVAILABLE/.test(s) ? 'ota-info' : 'ota-none';
+    return `<span class="ota-chip ${cls}">${label}: ${esc(s || '-')}</span>`;
+  }
+  function toast(msg, type, ms) { toastEl.textContent = msg; toastEl.className = type ? 'ota-' + type : ''; toastEl.style.display = 'block'; clearTimeout(toastEl._t); toastEl._t = setTimeout(() => (toastEl.style.display = 'none'), ms || 3000); }
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+  function fmtVnd(v) { const n = Number(v); return n ? n.toLocaleString('vi-VN') + 'đ' : ''; }
+  function localDate(d) { return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); }
+  function weekday(d) { return ['CN', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7'][new Date(d + 'T00:00:00').getDay()]; }
+  function icon(name) {
+    const paths = {
+      hourly: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+      overnight: '<path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/>',
+      daily: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
+      lock: '<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
+      avail: '<circle cx="12" cy="12" r="9"/><path d="M8 12.5l2.5 2.5L16 9.5"/>',
+      warn: '<path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18h.01"/>',
+    };
+    return `<svg class="ota-i ota-i-${name}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">${paths[name] || paths.lock}</svg>`;
+  }
+  function el(tag, props) { const e = document.createElement(tag); Object.assign(e, props); return e; }
+
+  loadRecent(); // badge on load
+})();
